@@ -102,22 +102,22 @@ def parse_args():
     parser.add_argument("--tables", type=int, default=5, help="the number of tables")
     parser.add_argument("--replicas_per_ts_per_table", type=int, default=100,
                         help="maximum number of replicas per table and tablet server")
-    parser.add_argument("--initial_cluster_state_fpath", type=str, default="",
+    parser.add_argument("--initial_cluster_state", type=str, default="",
                         help="path to the file containing intial state of the cluster; "
                         "if not set, the initial state is auto-generated")
-    parser.add_argument("--injected_events_fpath", type=str, default="",
+    parser.add_argument("--injected_events", type=str, default="",
                         help="path to the file containing set of events to inject")
     args = parser.parse_args()
     return args.ts, args.tables, args.replicas_per_ts_per_table,\
-            args.initial_cluster_state_fpath, args.injected_events_fpath
+            args.initial_cluster_state, args.injected_events
 
 def main():
     # Set initial state of cluster
-    n, t, r, initial_cluster_state, injected_events_fpath = parse_args()
+    n, t, r, initial_cluster_state_fpath, injected_events_fpath = parse_args()
 
     cluster = []
-    if initial_cluster_state:
-        cluster = parse_cluster_state(initial_cluster_state)
+    if initial_cluster_state_fpath:
+        cluster = parse_cluster_state(initial_cluster_state_fpath)
     else:
         cluster = gen_uniform_cluster(n, t, r)
     print "Initial cluster state =", cluster
