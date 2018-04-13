@@ -14,6 +14,15 @@ MOVE_SUCCEED = "move_succeed"
 MOVE_FAIL_START = "move_fail_start"
 MOVE_FAIL_STOP = "move_fail_stop"
 
+# Read and parse cluster state from the file at the specified path. See
+# the doc for the get_uniform_cluster() function for the cluster state format.
+def parse_cluster_state(cluster_fpath):
+    cluster = []
+    f = open(cluster_fpath)
+    for t in json.load(f):
+        cluster.append(t)
+    return cluster
+
 # Generate a cluster of n tablet servers and t tables.
 # Each tablet server will have will have < r replicas
 # for each table, chosen uniformly at random from [0, r).
@@ -45,23 +54,6 @@ def table_skew(table):
 def pick_move(table):
     return (len(table) - 1, 0)
 
-# Parse the file with events to be injected during the simulation. The file
-# format for the file is JSON, and the informal scheme is the following:
-# [ { "time": <int>, "type": <str>, "data": <object> }, ... ]
-#
-# E.g.:
-# [
-#   { "time": 10, "type": "move_fail_start", "data": { "fraction": 0.5 } },
-#   { "time": 1000, "type": "move_fail_stop", "data": null }
-# ]
-#
-def parse_events(events_fpath):
-    events = []
-    f = open(events_fpath)
-    for e in json.load(f):
-        events.append((e['time'], e['type'], e['data']))
-    return events
-
 # Apply the move 'move' to the table 'table'.
 def apply_move(table, move):
     src, dst = move
@@ -86,6 +78,23 @@ def apply_event(cluster, event):
             table[dst] -= 1
 apply_event.failure_fraction = 0
 
+# Parse the file with events to be injected during the simulation. The file
+# format for the file is JSON, and the informal scheme is the following:
+# [ { "time": <int>, "type": <str>, "data": <object> }, ... ]
+#
+# E.g.:
+# [
+#   { "time": 10, "type": "move_fail_start", "data": { "fraction": 0.5 } },
+#   { "time": 1000, "type": "move_fail_stop", "data": null }
+# ]
+#
+def parse_events(events_fpath):
+    events = []
+    f = open(events_fpath)
+    for e in json.load(f):
+        events.append((e['time'], e['type'], e['data']))
+    return events
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="A simulation of Kudu rebalancing")
@@ -93,15 +102,24 @@ def parse_args():
     parser.add_argument("--tables", type=int, default=5, help="the number of tables")
     parser.add_argument("--replicas_per_ts_per_table", type=int, default=100,
                         help="maximum number of replicas per table and tablet server")
+    parser.add_argument("--initial_cluster_state_fpath", type=str, default="",
+                        help="path to the file containing intial state of the cluster; "
+                        "if not set, the initial state is auto-generated")
     parser.add_argument("--injected_events_fpath", type=str, default="",
                         help="path to the file containing set of events to inject")
     args = parser.parse_args()
-    return args.ts, args.tables, args.replicas_per_ts_per_table, args.injected_events_fpath
+    return args.ts, args.tables, args.replicas_per_ts_per_table,\
+            args.initial_cluster_state_fpath, args.injected_events_fpath
 
 def main():
     # Set initial state of cluster
-    n, t, r, injected_events_fpath = parse_args()
-    cluster = gen_uniform_cluster(n, t, r)
+    n, t, r, initial_cluster_state, injected_events_fpath = parse_args()
+
+    cluster = []
+    if initial_cluster_state:
+        cluster = parse_cluster_state(initial_cluster_state)
+    else:
+        cluster = gen_uniform_cluster(n, t, r)
     print "Initial cluster state =", cluster
 
     # Set up pool of fixed capacity
