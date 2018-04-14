@@ -10,9 +10,25 @@ MAX_MOVE_STEPS = 5
 
 # Event types.
 # Move succeeded. The payload will be (table name, (src TS index, dest TS index)).
-MOVE_SUCCEED = "move_succeed"
-MOVE_FAIL_START = "move_fail_start"
-MOVE_FAIL_STOP = "move_fail_stop"
+EVT_MOVE_SUCCEED = "move_succeed"
+EVT_MOVE_FAIL = "move_fail"
+
+# Simulation stats class -- a collection for various metrics.
+class EventStats:
+    def __init__(self):
+        self.event_count = {}
+        self.event_count[EVT_MOVE_SUCCEED] = 0
+        self.event_count[EVT_MOVE_FAIL] = 0
+
+    def increment(self, evt_type):
+        self.event_count[evt_type] += 1
+
+    def get_stats(self, evt_type):
+        return self.event_count[evt_type]
+
+    def print_stats(self):
+        for k, v in self.event_count.iteritems():
+            print("{}\t\t{}".format(k, v))
 
 # Read and parse cluster state from the file at the specified path. See
 # the doc for the get_uniform_cluster() function for the cluster state format.
@@ -41,42 +57,97 @@ def total_replicas_in_cluster(cluster):
 
 # Return the table skew of 'table'.
 # Table skew is (# replicas on TS with most replica) - (# replicas on TS with least replica).
-# This modifies table so it is sorted by # of replicas, increasing.
 def table_skew(table):
-    table.sort()
-    return table[-1] - table[0]
+    return max(table) - min(table)
 
 # Return the next move that should be done to balance table, encoded as (i, j)
 # where i is the index of the TS to move from and j is the index of the TS to
 # move to.
-# This function assumes the table isn't balanced, else it may return a useless or pernicious move.
-# No randomization is added.
 def pick_move(table):
-    return (len(table) - 1, 0)
+    if not table:
+        return None
+    min_idx = 0
+    max_idx = 0
+    for i, e in enumerate(table):
+        if e <= table[min_idx]:
+            min_idx = i
+        if e >= table[max_idx]:
+            max_idx = i
+    if min_idx == max_idx or table[max_idx] - table[min_idx] <= 1:
+        return None
+    return (max_idx, min_idx)
 
 # Apply the move 'move' to the table 'table'.
-def apply_move(table, move):
+def apply_move(op):
+    table, move, _ = op
     src, dst = move
     table[src] -= 1
     table[dst] += 1
 
-# Apply the event to the cluster state.
-# Nothing to do here right now since moves always succeed, so we apply them to the cluster state
-# when they are proposed. This makes sense since we would consider them applied while they are in flight.
-def apply_event(cluster, event):
-    if event[1] == MOVE_FAIL_START:
-        apply_event.failure_fraction = event[2]['fraction']
-    if event[1] == MOVE_FAIL_STOP:
-        apply_event.failure_fraction = 0
+def revert_move(op):
+    table, move, _ = op
+    src, dst = move
+    table[src] += 1
+    table[dst] -= 1
 
-    if event[1] == MOVE_SUCCEED and apply_event.failure_fraction != 0:
-        # Undo the move if it's set to fail.
-        table = event[2][0]
-        src, dst = event[2][1]
-        if random.random() < apply_event.failure_fraction:
-            table[src] += 1
-            table[dst] -= 1
-apply_event.failure_fraction = 0
+# Apply the events due at the specified time.
+def process_events(events, t, pool, stats):
+    # Process special events first.
+    processed_event_ids = []
+    for event_id, event in events.iteritems():
+        event_time = event[0]
+        event_type = event[1]
+        event_data = event[2]
+        if event_type == EVT_MOVE_FAIL:
+            if event_time == t:
+                failure_fraction = event_data['fraction']
+                if random.random() < failure_fraction and len(pool) > 0:
+                    keys = pool.keys()
+                    revert_op_id = keys[random.randrange(0, len(keys))]
+                    op = pool[revert_op_id]
+                    revert_move(op)
+                    # Mark corresponding EVT_MOVE_SUCCEED event for removal.
+                    processed_event_ids.append(op[2])
+                    del pool[revert_op_id]
+                    stats.increment(event_type)
+                # EVT_MOVE_FAIL is a timespan event, self-perpetuating itself
+                events[event_id] = (event_time + 1, event_type, event_data)
+            if event_data['stop_time'] == t:
+                processed_event_ids.append(event_id)
+    for event_id in processed_event_ids:
+        del events[event_id]
+    processed_event_ids = []
+
+    for event_id, event in events.iteritems():
+        event_time = event[0]
+        event_type = event[1]
+        event_data = event[2]
+        if event_type == EVT_MOVE_FAIL:
+            # Should have been processed already.
+            assert(t != event_time)
+            continue
+        elif event_type == EVT_MOVE_SUCCEED:
+            if t == event_time:
+                op_id = event_data[2]
+                del pool[op_id]
+                stats.increment(event_type)
+                processed_event_ids.append(event_id)
+        else:
+            raise Exception("unknown event type: {}".format(event_type))
+    for event_id in processed_event_ids:
+        del events[event_id]
+
+
+def has_standard_events(events):
+    for _, event in events.iteritems():
+        event_type = event[1]
+        if event_type == EVT_MOVE_SUCCEED:
+            return True
+        elif event_type == EVT_MOVE_FAIL:
+            continue
+        else:
+            raise Exception("unknown event type: {}".format(event_type))
+
 
 # Parse the file with events to be injected during the simulation. The file
 # format for the file is JSON, and the informal scheme is the following:
@@ -84,16 +155,20 @@ apply_event.failure_fraction = 0
 #
 # E.g.:
 # [
-#   { "time": 10, "type": "move_fail_start", "data": { "fraction": 0.5 } },
-#   { "time": 1000, "type": "move_fail_stop", "data": null }
+#   {
+#     "time": 10,
+#     "type": "move_fail",
+#     "data": { "fraction": 0.5, "stop_time": 1000 }
+#   }
 # ]
 #
-def parse_events(events_fpath):
-    events = []
+def parse_events(events_fpath, event_id):
+    events = {}
     f = open(events_fpath)
     for e in json.load(f):
-        events.append((e['time'], e['type'], e['data']))
-    return events
+        event_id += 1
+        events[event_id] = (e['time'], e['type'], e['data'])
+    return events, event_id
 
 
 def parse_args():
@@ -124,90 +199,74 @@ def main():
 
     # Set up pool of fixed capacity
     max_pool_size = POOL_SLOTS_PER_TS * n
-    pool = []
+    pool = {}
 
     # Set up event queue.
     # An event will be modeled as a tuple (time, type, data needed to apply event to the cluster).
-    events = []
+    events = {}
+
+    # Assign unique identifiers to the events.
+    event_id = -1
 
     # Add injected events, if any specified.
-    injected_events = []
     if injected_events_fpath:
-        injected_events = parse_events(injected_events_fpath)
-        print("injecting events: {}".format(injected_events))
+        events, event_id = parse_events(injected_events_fpath, event_id)
+        print("injecting events: {}".format(events))
 
     # The total number of replicas shouldn't change. Compute it pre-rebalancing
     # so we can check that invariant.
-    # TODO: Stop sorting the cluster list so we can track table identity and maintain the invariant per table.
     total_replicas = total_replicas_in_cluster(cluster)
+
+    # Assign unique identifiers to the operations in the pool.
+    op_id = -1
 
     # Advance time in discrete steps.
     t = -1
-    while True:
+
+    stats = EventStats()
+    has_moves = True
+    while has_moves or has_standard_events(events) > 0:
         # Invariants for each time step.
         # Total number of replicas is constant.
         # TODO: Total number of replicas per table is constant.
         assert(total_replicas == total_replicas_in_cluster(cluster))
         # Every event is an ongoing move; True for now.
-        assert(len(pool) == len(events))
+        #assert(len(pool) == len(events))
 
         # Advance time at the start so we can use continue statements.
         t += 1
 
-        for i, e in enumerate(injected_events):
-            if e[0] == t:
-                apply_event(cluster, e)
-                injected_events.pop(i)
-
-        #print ("Cluster state at t = %d:" % t), cluster
-
-        # Apply events.
-        # This is inefficient. Would be better to keep events sorted by time.
-        # Also I'm cheating and I know I can pop a move off of the front of pool every time an event is triggered.
-        for i, e in enumerate(events):
-            if e[0] == t:
-                apply_event(cluster, e)
-                events.pop(i)
-                pool.pop(0)
-
-        # Don't act if the pool is full.
-        if len(pool) >= max_pool_size:
-            assert(len(pool) == max_pool_size)
-            #print "pool full: no action for step t =", t
-            continue
+        # Process regular events.
+        process_events(events, t, pool, stats)
 
         # Each time step we exhaust our pool capacity.
         while len(pool) < max_pool_size:
-            # Sort tables by skew, from highest to lowest skew.
-            tables_by_skew = sorted([table for table in cluster], key=table_skew, reverse=True)
+            # Sort tables by skew, from highest to lowest skew, and pick
+            # a table with the highest skew to operate with.
+            table = sorted([table for table in cluster], key=table_skew, reverse=True)[0]
 
-            # If the most skewed table is balanced, we're done.
-            # Well, just because moves always succeed in this toy first version.
-            # Really we should wait until the pool clears.
-            if table_skew(tables_by_skew[0]) <= 1:
-                print 'BALANCED at t =', t
-                print "Cluster =", cluster
-                exit(0)
+            # Pick the move.
+            move = pick_move(table)
+            has_moves = True if move else False;
+            if not has_moves:
+                break
 
-            # Iterate by skew.
-            for table in tables_by_skew:
-                if len(pool) >= max_pool_size:
-                    assert(len(pool) == max_pool_size)
-                    #print "pool filled: not finding more moves for t =", t
-                    break
+            # Cheat a bit and just apply the move.
+            # This avoids queueing it to succeed at some point and then having to apply it each
+            # time step, which involves making copies of the cluster state to which the move can be applied.
+            # Errors could be modeled as "undos" of moves in this paradigm.
+            op_id += 1
+            event_id += 1
+            pool[op_id] = (table, move, event_id)
+            apply_move(pool[op_id])
 
-                # Pick the move.
-                move = pick_move(table)
+            # Add a no-op to the event queue for when the move succeeds.
+            t_complete = t + random.randrange(1, MAX_MOVE_STEPS)
+            events[event_id] = (t_complete, EVT_MOVE_SUCCEED, (table, move, op_id))
 
-                # Cheat a bit and just apply the move.
-                # This avoids queueing it to succeed at some point and then having to apply it each
-                # time step, which involves making copies of the cluster state to which the move can be applied.
-                # Errors could be modeled as "undos" of moves in this paradigm.
-                pool.append(move)
-                apply_move(table, move)
-
-                # Add a no-op to the event queue for when the move succeeds.
-                events.append((t + random.randrange(1, MAX_MOVE_STEPS), MOVE_SUCCEED, (table, move)))
+    print("BALANCED at t = {}".format(t))
+    print("cluster = {}".format(cluster))
+    stats.print_stats()
 
 if __name__ == "__main__":
     main()

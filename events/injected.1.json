@@ -1,4 +1,7 @@
 [
-  { "time": 10, "type": "move_fail_start", "data": { "fraction": 0.9 } },
-  { "time": 10000, "type": "move_fail_stop", "data": null }
+  {
+    "time": 10,
+    "type": "move_fail",
+    "data": { "fraction": 0.1, "stop_time": 1000 }
+  }
 ]
