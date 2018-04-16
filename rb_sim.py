@@ -9,9 +9,15 @@ POOL_SLOTS_PER_TS=10
 MAX_MOVE_STEPS = 5
 
 # Event types.
+EVT_MOVE_FAIL_FRACTION = "move_fail_fraction"
+# Failed to move tablet replica.
+EVT_MOVE_FAIL = "move_fail"
 # Move succeeded. The payload will be (table name, (src TS index, dest TS index)).
 EVT_MOVE_SUCCEED = "move_succeed"
-EVT_MOVE_FAIL = "move_fail"
+# A new tablet server has been added into the system.
+EVT_TSERVER_ADDED = "tserver_added"
+# A new table has been created.
+EVT_TABLE_CREATED = "table_created"
 
 # Simulation stats class -- a collection for various metrics.
 class EventStats:
@@ -19,6 +25,7 @@ class EventStats:
         self.event_count = {}
         self.event_count[EVT_MOVE_SUCCEED] = 0
         self.event_count[EVT_MOVE_FAIL] = 0
+        self.event_count[EVT_TABLE_CREATED] = 0
 
     def increment(self, evt_type):
         self.event_count[evt_type] += 1
@@ -91,29 +98,31 @@ def revert_move(op):
     table[dst] -= 1
 
 # Apply the events due at the specified time.
-def process_events(events, t, pool, stats):
+def process_events(cluster, events, t, pool, stats):
+    move_failure_fraction = 0.0
     # Process special events first.
     processed_event_ids = []
     for event_id, event in events.iteritems():
         event_time = event[0]
         event_type = event[1]
         event_data = event[2]
-        if event_type == EVT_MOVE_FAIL:
-            if event_time == t:
-                failure_fraction = event_data['fraction']
-                if random.random() < failure_fraction and len(pool) > 0:
-                    keys = pool.keys()
-                    revert_op_id = keys[random.randrange(0, len(keys))]
-                    op = pool[revert_op_id]
-                    revert_move(op)
-                    # Mark corresponding EVT_MOVE_SUCCEED event for removal.
-                    processed_event_ids.append(op[2])
-                    del pool[revert_op_id]
-                    stats.increment(event_type)
-                # EVT_MOVE_FAIL is a timespan event, self-perpetuating itself
-                events[event_id] = (event_time + 1, event_type, event_data)
+        if event_time != t:
+            continue
+
+        if event_type == EVT_MOVE_FAIL_FRACTION:
+            fraction = event_data['fraction']
+            # EVT_MOVE_FAIL_FRACTION is a timespan event, self-perpetuating itself
+            move_failure_fraction += fraction
+            events[event_id] = (event_time + 1, event_type, event_data)
             if event_data['stop_time'] == t:
+                move_failure_fraction -= fraction
                 processed_event_ids.append(event_id)
+        elif event_type == EVT_TSERVER_ADDED:
+            # New tablet servers don't have any replicas at the beginning.
+            for table in cluster:
+                table.append(0)
+            processed_event_ids.append(event_id)
+
     for event_id in processed_event_ids:
         del events[event_id]
     processed_event_ids = []
@@ -122,31 +131,69 @@ def process_events(events, t, pool, stats):
         event_time = event[0]
         event_type = event[1]
         event_data = event[2]
-        if event_type == EVT_MOVE_FAIL:
-            # Should have been processed already.
+        if event_type in [ EVT_MOVE_FAIL_FRACTION, EVT_TSERVER_ADDED ]:
+            # Special events should have been processed already.
             assert(t != event_time)
             continue
-        elif event_type == EVT_MOVE_SUCCEED:
+        elif event_type in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
             if t == event_time:
                 op_id = event_data[2]
+                if event_type == EVT_MOVE_FAIL:
+                    revert_move(pool[op_id])
                 del pool[op_id]
+                stats.increment(event_type)
+                processed_event_ids.append(event_id)
+        elif event_type == EVT_TABLE_CREATED:
+            if t == event_time:
+                new_table = []
+                last_table = cluster[-1]
+                for e in last_table:
+                    new_table.append(e)
+                cluster.append(new_table)
                 stats.increment(event_type)
                 processed_event_ids.append(event_id)
         else:
             raise Exception("unknown event type: {}".format(event_type))
+
     for event_id in processed_event_ids:
         del events[event_id]
+
+    return move_failure_fraction
 
 
 def has_standard_events(events):
     for _, event in events.iteritems():
         event_type = event[1]
-        if event_type == EVT_MOVE_SUCCEED:
+        if event_type in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
             return True
-        elif event_type == EVT_MOVE_FAIL:
+        elif event_type in [ EVT_MOVE_FAIL_FRACTION, EVT_TSERVER_ADDED, EVT_TABLE_CREATED ]:
             continue
         else:
             raise Exception("unknown event type: {}".format(event_type))
+
+# Compute and return per-table skew in the cluster.
+def per_table_skew(cluster):
+    if not cluster:
+        return -1
+
+    per_table_skew = []
+    for table in cluster:
+        per_table_skew.append(max(table) - min(table))
+    return per_table_skew
+
+# Compute and return cluster skew.
+def cluster_skew(cluster):
+    if not cluster:
+        return -1
+
+    per_server_replicas_num = [0] * len(cluster[-1])
+    for table in cluster:
+        for idx, ts_num in enumerate(table):
+            per_server_replicas_num[idx] += ts_num
+    min_replicas_num = min(per_server_replicas_num)
+    max_replicas_num = max(per_server_replicas_num)
+
+    return max_replicas_num - min_replicas_num
 
 
 # Parse the file with events to be injected during the simulation. The file
@@ -162,13 +209,14 @@ def has_standard_events(events):
 #   }
 # ]
 #
-def parse_events(events_fpath, event_id):
-    events = {}
-    f = open(events_fpath)
-    for e in json.load(f):
-        event_id += 1
-        events[event_id] = (e['time'], e['type'], e['data'])
-    return events, event_id
+def parse_events(events_fpaths, events, event_id):
+    fpaths = events_fpaths.split(",")
+    for fpath in fpaths:
+        f = open(fpath)
+        for e in json.load(f):
+            event_id += 1
+            events[event_id] = (e['time'], e['type'], e['data'])
+    return event_id
 
 
 def parse_args():
@@ -188,14 +236,14 @@ def parse_args():
 
 def main():
     # Set initial state of cluster
-    n, t, r, initial_cluster_state_fpath, injected_events_fpath = parse_args()
+    n, t, r, initial_cluster_state_fpath, injected_events = parse_args()
 
     cluster = []
     if initial_cluster_state_fpath:
         cluster = parse_cluster_state(initial_cluster_state_fpath)
     else:
         cluster = gen_uniform_cluster(n, t, r)
-    print "Initial cluster state =", cluster
+    print("\ninitial cluster state\n{}\n".format(cluster))
 
     # Set up pool of fixed capacity
     max_pool_size = POOL_SLOTS_PER_TS * n
@@ -209,8 +257,8 @@ def main():
     event_id = -1
 
     # Add injected events, if any specified.
-    if injected_events_fpath:
-        events, event_id = parse_events(injected_events_fpath, event_id)
+    if injected_events:
+        event_id = parse_events(injected_events, events, event_id)
         print("injecting events: {}".format(events))
 
     # The total number of replicas shouldn't change. Compute it pre-rebalancing
@@ -225,19 +273,14 @@ def main():
 
     stats = EventStats()
     has_moves = True
+    # Continue while there are some moves to be performed or there are events
+    # to happen.
     while has_moves or has_standard_events(events) > 0:
-        # Invariants for each time step.
-        # Total number of replicas is constant.
-        # TODO: Total number of replicas per table is constant.
-        assert(total_replicas == total_replicas_in_cluster(cluster))
-        # Every event is an ongoing move; True for now.
-        #assert(len(pool) == len(events))
-
         # Advance time at the start so we can use continue statements.
         t += 1
 
         # Process regular events.
-        process_events(events, t, pool, stats)
+        move_failure_fraction = process_events(cluster, events, t, pool, stats)
 
         # Each time step we exhaust our pool capacity.
         while len(pool) < max_pool_size:
@@ -247,7 +290,7 @@ def main():
 
             # Pick the move.
             move = pick_move(table)
-            has_moves = True if move else False;
+            has_moves = True if move else False
             if not has_moves:
                 break
 
@@ -260,13 +303,19 @@ def main():
             pool[op_id] = (table, move, event_id)
             apply_move(pool[op_id])
 
-            # Add a no-op to the event queue for when the move succeeds.
+            # Add an event for when move to succeed (no-op) or fail.
             t_complete = t + random.randrange(1, MAX_MOVE_STEPS)
-            events[event_id] = (t_complete, EVT_MOVE_SUCCEED, (table, move, op_id))
+            if random.random() < move_failure_fraction:
+                events[event_id] = (t_complete, EVT_MOVE_FAIL, (table, move, op_id))
+            else:
+                events[event_id] = (t_complete, EVT_MOVE_SUCCEED, (table, move, op_id))
 
     print("BALANCED at t = {}".format(t))
-    print("cluster = {}".format(cluster))
+    print("\nbalanced cluster state\n{}\n".format(cluster))
+    print("per-table skew:\t{}".format(per_table_skew(cluster)))
+    print("cluster skew  :\t{}".format(cluster_skew(cluster)))
     stats.print_stats()
+
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,0 @@
-[
-  {
-    "time": 10,
-    "type": "move_fail",
-    "data": { "fraction": 0.1, "stop_time": 1000 }
-  }
-]
