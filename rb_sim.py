@@ -18,6 +18,8 @@ EVT_MOVE_SUCCEED = "move_succeed"
 EVT_TSERVER_ADDED = "tserver_added"
 # A new table has been created.
 EVT_TABLE_CREATED = "table_created"
+# A table has been dropped.
+EVT_TABLE_DROPPED = "table_dropped"
 
 # Simulation stats class -- a collection for various metrics.
 class EventStats:
@@ -26,6 +28,7 @@ class EventStats:
         self.event_count[EVT_MOVE_SUCCEED] = 0
         self.event_count[EVT_MOVE_FAIL] = 0
         self.event_count[EVT_TABLE_CREATED] = 0
+        self.event_count[EVT_TABLE_DROPPED] = 0
 
     def increment(self, evt_type):
         self.event_count[evt_type] += 1
@@ -122,6 +125,20 @@ def process_events(cluster, events, t, pool, stats):
             for table in cluster:
                 table.append(0)
             processed_event_ids.append(event_id)
+        elif event_type == EVT_TABLE_CREATED:
+            new_table = []
+            last_table = cluster[-1]
+            for e in last_table:
+                new_table.append(e)
+            cluster.append(new_table)
+            stats.increment(event_type)
+            processed_event_ids.append(event_id)
+        elif event_type == EVT_TABLE_DROPPED:
+            idx = random.randrange(0, len(cluster))
+            #cluster.pop(idx)
+            del cluster[idx]
+            stats.increment(event_type)
+            processed_event_ids.append(event_id)
 
     for event_id in processed_event_ids:
         del events[event_id]
@@ -131,25 +148,17 @@ def process_events(cluster, events, t, pool, stats):
         event_time = event[0]
         event_type = event[1]
         event_data = event[2]
-        if event_type in [ EVT_MOVE_FAIL_FRACTION, EVT_TSERVER_ADDED ]:
+        if event_type not in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
             # Special events should have been processed already.
             assert(t != event_time)
             continue
-        elif event_type in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
+
+        if event_type in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
             if t == event_time:
                 op_id = event_data[2]
                 if event_type == EVT_MOVE_FAIL:
                     revert_move(pool[op_id])
                 del pool[op_id]
-                stats.increment(event_type)
-                processed_event_ids.append(event_id)
-        elif event_type == EVT_TABLE_CREATED:
-            if t == event_time:
-                new_table = []
-                last_table = cluster[-1]
-                for e in last_table:
-                    new_table.append(e)
-                cluster.append(new_table)
                 stats.increment(event_type)
                 processed_event_ids.append(event_id)
         else:
@@ -166,10 +175,8 @@ def has_standard_events(events):
         event_type = event[1]
         if event_type in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
             return True
-        elif event_type in [ EVT_MOVE_FAIL_FRACTION, EVT_TSERVER_ADDED, EVT_TABLE_CREATED ]:
-            continue
         else:
-            raise Exception("unknown event type: {}".format(event_type))
+            return False
 
 # Compute and return per-table skew in the cluster.
 def per_table_skew(cluster):
