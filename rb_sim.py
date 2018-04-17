@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import random
 
@@ -97,8 +98,8 @@ def pick_move_cluster_balanced(table, cluster):
         return None
 
     # TODO(aserbin): It's not quite optimal to recompute this every time; maybe
-    #                it's worth to update the server_replicas_num every time
-    #                a move happens and don't recompute everything from scratch.
+    #                it's worth to update the server_replicas_num upon
+    #                [apply,rollback]_move(), not recomputing from scratch.
     server_replicas_num = [0] * len(cluster[0])
     for t in cluster:
         for idx, replicas_num in enumerate(t):
@@ -117,13 +118,78 @@ def pick_move_cluster_balanced(table, cluster):
         return None
     return (max_idx, min_idx)
 
-# Apply the move 'move' to the table 'table'.
+
+# Same as pick_move_cluster_balanced(), but also take into account limits
+# on per-tserver number of operations.
+def pick_move_cluster_balanced_pool_cap(table, cluster, pool):
+    if not table or not cluster:
+        return None
+
+    # Copy the original tserver replica count information table
+    # since it will be modified to reflect availability of tserver for
+    # additional replica movement operations.
+    table_replicas = copy.copy(table)
+    total_table_replicas_num = 0
+    for n in table_replicas:
+        total_table_replicas_num += n
+    balanced_replicas_num = total_table_replicas_num / len(table_replicas)
+
+    # TODO(aserbin): It's not quite optimal to recompute this every time; maybe
+    #                it's worth to update the server_replicas_num upon
+    #                [apply,rollback]_move(), not recomputing from scratch.
+    server_replicas_num = [0] * len(cluster[0])
+    for t in cluster:
+        for idx, replicas_num in enumerate(t):
+            server_replicas_num[idx] += replicas_num
+
+    server_ops_num = [0] * len(table_replicas)
+    for _, (_, move, _) in pool.iteritems():
+        src, dst = move
+        server_ops_num[src] += 1
+        server_ops_num[dst] += 1
+
+    # Find tservers available to place more operations.
+    min_idx = -1
+    max_idx = -1
+    for idx, ops_num in enumerate(server_ops_num):
+        if ops_num >= POOL_SLOTS_PER_TS:
+            table_replicas[idx] = -1
+            continue
+        if min_idx < 0:
+            min_idx = idx
+        if max_idx < 0:
+            max_idx = idx
+
+    if min_idx < 0 or max_idx < 0:
+        return None
+
+    for idx, e in enumerate(table_replicas):
+        if e < 0:
+            continue
+        if e <= table_replicas[min_idx]:
+            if e < table_replicas[min_idx] \
+                    or server_replicas_num[idx] < server_replicas_num[min_idx]:
+                min_idx = idx
+        if e >= table_replicas[max_idx]:
+            if e > table_replicas[max_idx] \
+                    or server_replicas_num[idx] > server_replicas_num[max_idx]:
+                max_idx = idx
+
+    if min_idx == max_idx \
+            or balanced_replicas_num >= table_replicas[max_idx] \
+            or table_replicas[max_idx] - table_replicas[min_idx] <= 1:
+        return None
+    return (max_idx, min_idx)
+
+
+# Apply the move operation 'op'.
 def apply_move(op):
     table, move, _ = op
     src, dst = move
     table[src] -= 1
     table[dst] += 1
 
+# Rollback the move operation 'op'.
 def revert_move(op):
     table, move, _ = op
     src, dst = move
@@ -135,10 +201,7 @@ def process_events(cluster, events, t, pool, stats):
     move_failure_fraction = 0.0
     # Process special events first.
     processed_event_ids = []
-    for event_id, event in events.iteritems():
-        event_time = event[0]
-        event_type = event[1]
-        event_data = event[2]
+    for event_id, (event_time, event_type, event_data) in events.iteritems():
         if event_time != t:
             continue
 
@@ -173,10 +236,7 @@ def process_events(cluster, events, t, pool, stats):
         del events[event_id]
     processed_event_ids = []
 
-    for event_id, event in events.iteritems():
-        event_time = event[0]
-        event_type = event[1]
-        event_data = event[2]
+    for event_id, (event_time, event_type, event_data) in events.iteritems():
         if event_type not in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
             # Special events should have been processed already.
             assert(t != event_time)
@@ -200,12 +260,10 @@ def process_events(cluster, events, t, pool, stats):
 
 
 def has_standard_events(events):
-    for _, event in events.iteritems():
-        event_type = event[1]
+    for _, (_, event_type, _) in events.iteritems():
         if event_type in [ EVT_MOVE_SUCCEED, EVT_MOVE_FAIL ]:
             return True
-        else:
-            return False
+    return False
 
 # Compute and return per-table skew in the cluster.
 def per_table_skew(cluster):
@@ -264,26 +322,31 @@ def parse_args():
     parser.add_argument("--initial_cluster_state", type=str, default="",
                         help="path to the file containing intial state of the cluster; "
                         "if not set, the initial state is auto-generated")
-    parser.add_argument("--injected_events", type=str, default="",
+    parser.add_argument("--inject_events", type=str, default="",
                         help="path to the file containing set of events to inject")
     args = parser.parse_args()
     return args.ts, args.tables, args.replicas_per_ts_per_table,\
-            args.initial_cluster_state, args.injected_events
+            args.initial_cluster_state, args.inject_events
 
 def main():
     # Set initial state of cluster
-    n, t, r, initial_cluster_state_fpath, injected_events = parse_args()
+    n, t, r, initial_cluster_state_fpath, inject_events = parse_args()
 
     cluster = []
     if initial_cluster_state_fpath:
         cluster = parse_cluster_state(initial_cluster_state_fpath)
     else:
         cluster = gen_uniform_cluster(n, t, r)
-    print("\ninitial cluster state\n{}\n".format(cluster))
+    print("initial cluster state\n{}".format(cluster))
+    print("per-table skew:\t{}".format(per_table_skew(cluster)))
+    print("cluster skew  :\t{}".format(cluster_skew(cluster)))
 
     # Set up pool of fixed capacity
     max_pool_size = POOL_SLOTS_PER_TS * n
     pool = {}
+
+    # In addition to total number of concurrent move operations,
+    # there is a limit on number of concurrent operations per tablet server.
 
     # Set up event queue.
     # An event will be modeled as a tuple (time, type, data needed to apply event to the cluster).
@@ -293,9 +356,9 @@ def main():
     event_id = -1
 
     # Add injected events, if any specified.
-    if injected_events:
-        event_id = parse_events(injected_events, events, event_id)
-        print("injecting events: {}".format(events))
+    if inject_events:
+        event_id = parse_events(inject_events, events, event_id)
+        #print("injecting events: {}".format(events))
 
     # The total number of replicas shouldn't change. Compute it pre-rebalancing
     # so we can check that invariant.
@@ -311,7 +374,7 @@ def main():
     has_moves = True
     # Continue while there are some moves to be performed or there are events
     # to happen.
-    while has_moves or has_standard_events(events) > 0:
+    while has_moves or has_standard_events(events):
         # Advance time at the start so we can use continue statements.
         t += 1
 
@@ -326,7 +389,8 @@ def main():
 
             # Pick the move.
             #move = pick_move(table)
-            move = pick_move_cluster_balanced(table, cluster)
+            #move = pick_move_cluster_balanced(table, cluster)
+            move = pick_move_cluster_balanced_pool_cap(table, cluster, pool)
             has_moves = True if move else False
             if not has_moves:
                 break
@@ -347,8 +411,8 @@ def main():
             else:
                 events[event_id] = (t_complete, EVT_MOVE_SUCCEED, (table, move, op_id))
 
-    print("BALANCED at t = {}".format(t))
-    print("\nbalanced cluster state\n{}\n".format(cluster))
+    print("\nBALANCED at t = {}\n".format(t))
+    print("balanced cluster state\n{}".format(cluster))
     print("per-table skew:\t{}".format(per_table_skew(cluster)))
     print("cluster skew  :\t{}".format(cluster_skew(cluster)))
     stats.print_stats()
