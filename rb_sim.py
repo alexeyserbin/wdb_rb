@@ -70,12 +70,14 @@ def total_replicas_in_cluster(cluster):
 def table_skew(table):
     return max(table) - min(table)
 
+
 # Return the next move that should be done to balance table, encoded as (i, j)
 # where i is the index of the TS to move from and j is the index of the TS to
 # move to.
 def pick_move(table):
     if not table:
         return None
+
     min_idx = 0
     max_idx = 0
     for i, e in enumerate(table):
@@ -83,6 +85,34 @@ def pick_move(table):
             min_idx = i
         if e >= table[max_idx]:
             max_idx = i
+    if min_idx == max_idx or table[max_idx] - table[min_idx] <= 1:
+        return None
+    return (max_idx, min_idx)
+
+
+# Same as pick_move(), but also try to optimize both per-table and per-cluster
+# skew.
+def pick_move_cluster_balanced(table, cluster):
+    if not table or not cluster:
+        return None
+
+    # TODO(aserbin): It's not quite optimal to recompute this every time; maybe
+    #                it's worth to update the server_replicas_num every time
+    #                a move happens and don't recompute everything from scratch.
+    server_replicas_num = [0] * len(cluster[0])
+    for t in cluster:
+        for idx, replicas_num in enumerate(t):
+            server_replicas_num[idx] += replicas_num
+
+    min_idx = 0
+    max_idx = 0
+    for i, e in enumerate(table):
+        if e <= table[min_idx]:
+            if e < table[min_idx] or server_replicas_num[i] < server_replicas_num[min_idx]:
+                min_idx = i
+        if e >= table[max_idx]:
+            if e > table[max_idx] or server_replicas_num[i] > server_replicas_num[max_idx]:
+                max_idx = i
     if min_idx == max_idx or table[max_idx] - table[min_idx] <= 1:
         return None
     return (max_idx, min_idx)
@@ -135,7 +165,6 @@ def process_events(cluster, events, t, pool, stats):
             processed_event_ids.append(event_id)
         elif event_type == EVT_TABLE_DROPPED:
             idx = random.randrange(0, len(cluster))
-            #cluster.pop(idx)
             del cluster[idx]
             stats.increment(event_type)
             processed_event_ids.append(event_id)
@@ -195,8 +224,8 @@ def cluster_skew(cluster):
 
     per_server_replicas_num = [0] * len(cluster[-1])
     for table in cluster:
-        for idx, ts_num in enumerate(table):
-            per_server_replicas_num[idx] += ts_num
+        for idx, replicas_num in enumerate(table):
+            per_server_replicas_num[idx] += replicas_num
     min_replicas_num = min(per_server_replicas_num)
     max_replicas_num = max(per_server_replicas_num)
 
@@ -296,7 +325,8 @@ def main():
             table = sorted([table for table in cluster], key=table_skew, reverse=True)[0]
 
             # Pick the move.
-            move = pick_move(table)
+            #move = pick_move(table)
+            move = pick_move_cluster_balanced(table, cluster)
             has_moves = True if move else False
             if not has_moves:
                 break
