@@ -38,8 +38,9 @@ class EventStats:
         return self.event_count[evt_type]
 
     def print_stats(self):
+        print("\nEvents statistics:")
         for k, v in self.event_count.iteritems():
-            print("{}\t\t{}".format(k, v))
+            print("  {}\t\t{}".format(k, v))
 
 # Read and parse cluster state from the file at the specified path. See
 # the doc for the get_uniform_cluster() function for the cluster state format.
@@ -75,7 +76,7 @@ def table_skew(table):
 # Return the next move that should be done to balance table, encoded as (i, j)
 # where i is the index of the TS to move from and j is the index of the TS to
 # move to.
-def pick_move(table):
+def pick_move_table_balance(table):
     if not table:
         return None
 
@@ -91,9 +92,9 @@ def pick_move(table):
     return (max_idx, min_idx)
 
 
-# Same as pick_move(), but also try to optimize both per-table and per-cluster
-# skew.
-def pick_move_cluster_balanced(table, cluster):
+# Same as pick_move_table_balance(), but also try to optimize both
+# the per-table and per-cluster skews.
+def pick_move_table_cluster_balance(table, cluster):
     if not table or not cluster:
         return None
 
@@ -119,9 +120,9 @@ def pick_move_cluster_balanced(table, cluster):
     return (max_idx, min_idx)
 
 
-# Same as pick_move_cluster_balanced(), but also take into account limits
+# Same as pick_move_table_cluster_balance(), but also take into account limits
 # on per-tserver number of operations.
-def pick_move_cluster_balanced_pool_cap(table, cluster, pool):
+def pick_move_table_cluster_balance_ops_cap(table, cluster, pool):
     if not table or not cluster:
         return None
 
@@ -197,7 +198,7 @@ def revert_move(op):
     table[dst] -= 1
 
 # Apply the events due at the specified time.
-def process_events(cluster, events, t, pool, stats):
+def process_events(cluster, events, t, pool, event_stats):
     move_failure_fraction = 0.0
     # Process special events first.
     processed_event_ids = []
@@ -224,12 +225,12 @@ def process_events(cluster, events, t, pool, stats):
             for e in last_table:
                 new_table.append(e)
             cluster.append(new_table)
-            stats.increment(event_type)
+            event_stats.increment(event_type)
             processed_event_ids.append(event_id)
         elif event_type == EVT_TABLE_DROPPED:
             idx = random.randrange(0, len(cluster))
             del cluster[idx]
-            stats.increment(event_type)
+            event_stats.increment(event_type)
             processed_event_ids.append(event_id)
 
     for event_id in processed_event_ids:
@@ -248,7 +249,7 @@ def process_events(cluster, events, t, pool, stats):
                 if event_type == EVT_MOVE_FAIL:
                     revert_move(pool[op_id])
                 del pool[op_id]
-                stats.increment(event_type)
+                event_stats.increment(event_type)
                 processed_event_ids.append(event_id)
         else:
             raise Exception("unknown event type: {}".format(event_type))
@@ -290,6 +291,12 @@ def cluster_skew(cluster):
     return max_replicas_num - min_replicas_num
 
 
+def print_cluster_info(cluster):
+    print("cluster state :\t{}".format(cluster))
+    print("per-table skew:\t{}".format(per_table_skew(cluster)))
+    print("cluster skew  :\t{}".format(cluster_skew(cluster)))
+
+
 # Parse the file with events to be injected during the simulation. The file
 # format for the file is JSON, and the informal scheme is the following:
 # [ { "time": <int>, "type": <str>, "data": <object> }, ... ]
@@ -319,27 +326,49 @@ def parse_args():
     parser.add_argument("--tables", type=int, default=5, help="the number of tables")
     parser.add_argument("--replicas_per_ts_per_table", type=int, default=100,
                         help="maximum number of replicas per table and tablet server")
+    parser.add_argument("--algo", type=str, default="table_cluster_balance_ops_cap",
+                        help="algorithm to use for picking replica movements: "
+                        "table_balance|table_cluster_balance|table_cluster_balance_ops_cap")
     parser.add_argument("--initial_cluster_state", type=str, default="",
                         help="path to the file containing intial state of the cluster; "
                         "if not set, the initial state is auto-generated")
     parser.add_argument("--inject_events", type=str, default="",
                         help="path to the file containing set of events to inject")
+    parser.add_argument("--cluster_state_history", type=str, default="",
+                        help="path to the file to output cluster state history")
+    parser.add_argument("--cluster_stats", type=str, default="",
+                        help="path to the file to output cluster statistics while rebalancing")
     args = parser.parse_args()
-    return args.ts, args.tables, args.replicas_per_ts_per_table,\
-            args.initial_cluster_state, args.inject_events
+    return args.ts, args.tables, args.replicas_per_ts_per_table, \
+            args.algo, args.initial_cluster_state, args.inject_events, \
+            args.cluster_state_history, args.cluster_stats
 
 def main():
-    # Set initial state of cluster
-    n, t, r, initial_cluster_state_fpath, inject_events = parse_args()
+    n, t, r, \
+            algo, \
+            initial_cluster_state_fpath, \
+            inject_events, \
+            cluster_state_history, \
+            cluster_stats = parse_args()
 
+    # Set initial state of the cluster.
     cluster = []
     if initial_cluster_state_fpath:
         cluster = parse_cluster_state(initial_cluster_state_fpath)
     else:
         cluster = gen_uniform_cluster(n, t, r)
-    print("initial cluster state\n{}".format(cluster))
-    print("per-table skew:\t{}".format(per_table_skew(cluster)))
-    print("cluster skew  :\t{}".format(cluster_skew(cluster)))
+
+    cluster_state_seq = []
+    cluster_state_history_f = None
+    if cluster_state_history:
+        cluster_state_history_f = open(cluster_state_history, "w")
+
+    cluster_stats_seq = []
+    cluster_stats_f = None
+    if cluster_stats:
+        cluster_stats_f = open(cluster_stats, "w")
+
+    print_cluster_info(cluster)
 
     # Set up pool of fixed capacity
     max_pool_size = POOL_SLOTS_PER_TS * n
@@ -370,7 +399,7 @@ def main():
     # Advance time in discrete steps.
     t = -1
 
-    stats = EventStats()
+    event_stats = EventStats()
     has_moves = True
     # Continue while there are some moves to be performed or there are events
     # to happen.
@@ -378,8 +407,13 @@ def main():
         # Advance time at the start so we can use continue statements.
         t += 1
 
+        if cluster_state_history_f:
+            cluster_state_seq.append(copy.deepcopy(cluster))
+        if cluster_stats_f:
+            cluster_stats_seq.append([cluster_skew(cluster), per_table_skew(cluster)])
+
         # Process regular events.
-        move_failure_fraction = process_events(cluster, events, t, pool, stats)
+        move_failure_fraction = process_events(cluster, events, t, pool, event_stats)
 
         # Each time step we exhaust our pool capacity.
         while len(pool) < max_pool_size:
@@ -388,9 +422,14 @@ def main():
             table = sorted([table for table in cluster], key=table_skew, reverse=True)[0]
 
             # Pick the move.
-            #move = pick_move(table)
-            #move = pick_move_cluster_balanced(table, cluster)
-            move = pick_move_cluster_balanced_pool_cap(table, cluster, pool)
+            if algo == "table_balance":
+                move = pick_move_table_balance(table)
+            elif algo == "table_cluster_balance":
+                move = pick_move_table_cluster_balance(table, cluster)
+            elif algo == "table_cluster_balance_ops_cap":
+                move = pick_move_table_cluster_balance_ops_cap(table, cluster, pool)
+            else:
+                raise Exception("'{}': unknown algorithm".format(algo))
             has_moves = True if move else False
             if not has_moves:
                 break
@@ -411,11 +450,19 @@ def main():
             else:
                 events[event_id] = (t_complete, EVT_MOVE_SUCCEED, (table, move, op_id))
 
-    print("\nBALANCED at t = {}\n".format(t))
-    print("balanced cluster state\n{}".format(cluster))
-    print("per-table skew:\t{}".format(per_table_skew(cluster)))
-    print("cluster skew  :\t{}".format(cluster_skew(cluster)))
-    stats.print_stats()
+    # Output the history of the cluster state.
+    if cluster_state_history_f:
+        json.dump(obj=cluster_state_seq, fp=cluster_state_history_f)
+        cluster_state_history_f.close()
+
+    # Output information on the cluster statistics over the time.
+    if cluster_stats_f:
+        json.dump(obj=cluster_stats_seq, fp=cluster_stats_f)
+        cluster_stats_f.close()
+
+    print("\nBALANCED at t = {}\twith algorithm '{}'\n".format(t, algo))
+    print_cluster_info(cluster)
+    event_stats.print_stats()
 
 
 if __name__ == "__main__":
